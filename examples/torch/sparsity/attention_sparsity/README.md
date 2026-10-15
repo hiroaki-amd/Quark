@@ -19,7 +19,7 @@ against real RULER prompts via the public
    ```bash
    git clone https://github.com/hiroaki-amd/Quark.git
    cd Quark
-   git checkout <this-branch>  # skip once merged
+   git checkout blasst-head-packing-experiment
    pip install -e .
    ```
 
@@ -130,3 +130,23 @@ attention heads) in memory at 131072 context; chunk size does not bias the measu
 memory use. These coefficients are specific to the model, the sampled prompts, and the tile
 shape used; recalibrate for any other model or kernel tiling rather than reusing them
 directly.
+
+## EXPERIMENTAL: GQA head-packing (this branch only, not in the main PR)
+
+`calibrate_model_head_packed.py` is the same driver, but models a real tiled kernel's GQA
+head-packing (a GQA group's query heads share one physical tile, so a key block is only
+skippable if every row across every head in the group agrees -- not just within one head's
+own tile, which is all `calibrate_model.py` models). Same RULER data, same always-on
+raw-point capture and plot:
+
+```bash
+python calibrate_model_head_packed.py \
+    --model Qwen/Qwen3-32B \
+    --ruler_dir ./ruler_data/qwen3_32b \
+    --context_lengths 32713 \
+    --group_size 8 \
+    --output qwen3_32b_head_packed_calibration.json
+```
+
+`--group_size` must match the model's real GQA group size (`num_attention_heads //
+num_key_value_heads`, from its HF config; 8 for Qwen3-32B).

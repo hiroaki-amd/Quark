@@ -163,6 +163,70 @@ def compute_skip_sparsity_multi_threshold(
     return sparsities.tolist()
 
 
+def compute_skip_sparsity_multi_threshold_head_packed(
+    scores: torch.Tensor,
+    thresholds: list[float],
+    block_size: int,
+    block_m: int,
+    group_size: int,
+) -> list[float]:
+    """
+    EXPERIMENTAL, not part of the calibration API surface: models AITER's real unified_2d
+    kernel skip granularity, where a GQA group's ``group_size`` query heads (all sharing one KV
+    head) are packed into a single physical ``block_m``-row tile, so a key block is only
+    skippable if *every* row across *all* those heads agrees -- not just within one head's own
+    ``block_m`` query rows, which is what :func:`compute_skip_sparsity_multi_threshold` (and this
+    project's calibration so far) models. The real per-head query-tile size is therefore
+    ``block_m // group_size``, not ``block_m``.
+
+    :param torch.Tensor scores: Pre-softmax attention scores, shape ``[batch, heads, q_len,
+        kv_len]``, with ``heads`` assumed to be ``num_kv_heads * group_size`` and GQA-grouped
+        contiguously (query heads ``[g*group_size, (g+1)*group_size)`` share KV head ``g`` --
+        matches HF's ``repeat_kv`` head ordering).
+    :param list[float] thresholds: Threshold values to evaluate.
+    :param int block_size: Key-block granularity (``BLOCK_N``-equivalent), as usual.
+    :param int block_m: The real physical query-tile size (``BLOCK_M``), covering all heads in
+        the group together (e.g. 128).
+    :param int group_size: Number of query heads per KV head (GQA group size).
+    :return: One sparsity value per entry in ``thresholds``, same order.
+    :rtype: list[float]
+    """
+    num_heads = scores.shape[1]
+    if num_heads % group_size != 0:
+        raise ValueError(f"heads ({num_heads}) must be a multiple of group_size ({group_size})")
+    if block_m % group_size != 0:
+        raise ValueError(f"block_m ({block_m}) must be a multiple of group_size ({group_size})")
+    query_block_size_per_head = block_m // group_size
+
+    block_max, block_valid, tile_valid = _block_max_and_validity(scores, block_size, query_block_size_per_head)
+    running_max_prev, has_predecessor = _running_max_prev_and_predecessor(block_max)
+
+    log_thresholds = torch.log(torch.tensor(thresholds, dtype=block_max.dtype, device=block_max.device))
+
+    diff = (block_max - running_max_prev).unsqueeze(-1)  # [..., qbs_per_head, num_kv_blocks, 1]
+    row_skip_ok = (diff < log_thresholds) & has_predecessor.unsqueeze(-1)
+    row_skip_ok_effective = row_skip_ok | (~block_valid).unsqueeze(-1)
+    # Shape so far: [batch, heads, num_q_blocks, qbs_per_head, num_kv_blocks, T]. Split heads into
+    # (num_kv_heads, group_size) and require agreement across both the per-head query positions
+    # (qbs_per_head) and the group's heads (group_size) -- the real physical block_m-row tile.
+    batch, _, num_q_blocks, qbs, num_kv_blocks, num_thresholds = row_skip_ok_effective.shape
+    num_kv_heads = num_heads // group_size
+    row_skip_ok_effective = row_skip_ok_effective.reshape(
+        batch, num_kv_heads, group_size, num_q_blocks, qbs, num_kv_blocks, num_thresholds
+    )
+    tile_skip = row_skip_ok_effective.all(dim=4).all(dim=2)  # -> [batch, num_kv_heads, num_q_blocks, num_kv_blocks, T]
+
+    tile_valid_grouped = tile_valid.reshape(batch, num_kv_heads, group_size, num_q_blocks, num_kv_blocks).any(dim=2)
+    tile_skip = tile_skip & tile_valid_grouped.unsqueeze(-1)
+
+    num_valid = tile_valid_grouped.sum()
+    if num_valid == 0:
+        return [0.0] * len(thresholds)
+
+    sparsities = tile_skip.sum(dim=tuple(range(tile_skip.ndim - 1))).float() / num_valid
+    return sparsities.tolist()
+
+
 class FlashSkipSoftmax:
     """
     Reference (calibration-time) skip-softmax method.
