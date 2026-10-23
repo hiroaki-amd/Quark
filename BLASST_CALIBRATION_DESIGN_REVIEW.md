@@ -1,5 +1,46 @@
 # BLASST attention-sparsity calibration in Quark: design for review
 
+## Changes since review
+
+An earlier version of this doc was reviewed by the Quark team, who sent four points of feedback.
+All four were implemented and validated (not just discussed) before this
+revision. Summary, in the order raised:
+
+1. **Placement in `quark/contrib/`, not `quark/torch/`.** Agreed outright. The
+   package now lives at `quark/contrib/attention_sparsity/` (code, tests, and
+   docs together, per `docs/source/intro_contrib.rst`), with its examples
+   under `examples/contrib/attention_sparsity/`. Section 2 below reflects the
+   new layout. CODEOWNERS, CI workflow approval, and the Intent-to-Contribute
+   issue are the one part of this we can't do ourselves from this checkout:
+   flagging that as a question back to you.
+2. **Softmax-hook hardening.** `calibration/context.py` no longer blanket-patches
+   `torch.nn.functional.softmax` and filters by tensor shape; it now wraps
+   `forward` only on attention-named modules (`*attn`/`*attention`), globally
+   patching `F.softmax` only for the scope of that module's own call,
+   mirroring the exact pattern Quark's own `prepare_for_attention_quant`
+   already uses. This closes the MoE-router false-positive risk you flagged.
+   We also confirmed your `softmax_quant_spec` concern was a real, not
+   hypothetical, silent-corruption risk (quantization's own hook does the
+   identical patch-scoping trick on the same model) and added an explicit
+   `RuntimeError` guard for it. The eager-mode/no-observations error message
+   and the chunking/memory documentation you asked about were already present
+   from before this round. Validated beyond unit tests: a real Qwen3-8B
+   calibration re-run under the new hook reproduced the previously recorded
+   fit exactly (`a=3.661323`, `b=9.350536`), so the interception mechanism
+   change doesn't alter what's measured.
+3. **Recording kernel tile shape.** `block_size`/`query_block_size` are now
+   recorded in the exported `sparse_attention_config` (Section 4), so a
+   consumer can confirm its kernel's tile shape matches before reusing fitted
+   coefficients.
+4. **Export placement.** Rather than folding `export.py` into
+   `quark/torch/export/` (which sits awkwardly now that point 1 puts this
+   package in `contrib/`), we added a test proving `sparse_attention_config`
+   and `quantization_config` already compose with no key collision on a
+   single `model.config.update()`/`save_pretrained()` round trip. This is the
+   one point where we're proposing a different answer than what you asked
+   for rather than doing it as suggested; let us know if that reasoning
+   doesn't hold up.
+
 ## 1. What this is
 
 BLASST ([arXiv:2512.12087](https://arxiv.org/abs/2512.12087)) is a block-sparse attention technique from NVIDIA
@@ -22,38 +63,47 @@ scope is that calibration step, not the serving kernel itself.
 
 NVIDIA keeps this same calibration logic in
 [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer), not in
-TensorRT-LLM itself. Quark is AMD's equivalent of Model Optimizer, and
-already separates calibration/PTQ tooling from the serving engine (ATOM) the
-same way for quantization, so we followed that same split: all of this lives
-in Quark. Concretely, we are proposing a new top-level `quark/torch/sparsity/`
-directory, alongside the existing `quark/torch/quantization/` and
-`quark/torch/pruning/`, with `attention_sparsity/` as its first subpackage
-(room for other sparsity techniques to land as siblings later, rather than
-overloading attention sparsity's own directory).
+TensorRT-LLM itself. Quark is AMD's equivalent of Model Optimizer, so the
+calibration/PTQ-vs-serving-engine split still matches, but per reviewer
+feedback this now lives in `quark/contrib/attention_sparsity/` rather than
+`quark/torch/sparsity/`, following the layout
+`docs/source/intro_contrib.rst` requires for a `contrib` component (code,
+`test/`, and `docs/` together in the component directory; `examples/` in the
+shared top-level tree).
 
 ```
-quark/torch/sparsity/attention_sparsity/
+quark/contrib/attention_sparsity/
 ├── config.py                 CalibrationConfig, SparseAttentionConfig, schema export
 ├── api.py                    ModelSparseAttentionCalibrator (top-level entry point)
 ├── export.py                 write/read sparse_attention_config in checkpoint config.json
+├── README.md                 package docs, Quick Start, support/contact
 ├── methods/
 │   └── flash_skip_softmax.py pure-PyTorch reference skip-softmax (calibration-time only)
-└── calibration/
-    ├── calibrator.py         DynamicThresholdCalibrator (the curve-fitting logic)
-    └── context.py            softmax monkeypatch that feeds the calibrator
+├── calibration/
+│   ├── calibrator.py         DynamicThresholdCalibrator (the curve-fitting logic)
+│   └── context.py            per-attention-module softmax hook that feeds the calibrator
+├── test/                     unit tests (CI only discovers contrib tests here)
+└── docs/
+    └── index.rst             auto-indexed landing page, no core doc files touched
+
+examples/contrib/attention_sparsity/
+├── calibrate_model.py        runnable argparse driver
+├── generate_ruler_data.sh    RULER data generation helper
+└── plot_calibration_fit.py   fit visualization
 ```
 
-This mirrors NVIDIA Model Optimizer's own `attention_sparsity/` layout
-(`config.py` / `calibration/` / `methods/` / a top-level API module), and
-follows Quark's own conventions rather than NVIDIA's: plain `@dataclass`
-configs (not pydantic), matching `quark/torch/pruning/config.py`.
+This still mirrors NVIDIA Model Optimizer's own `attention_sparsity/` layout
+internally (`config.py` / `calibration/` / `methods/` / a top-level API
+module) and Quark's own conventions (plain `@dataclass` configs, not
+pydantic, matching `quark/torch/pruning/config.py`); only the top-level
+parent directory changed.
 
 ## 3. Status
 
 Already implemented end to end on a working branch (not yet sent as a PR).
-All changes are additive: 17 new files, confined entirely to
-`quark/torch/sparsity/attention_sparsity/` and its tests under
-`test/test_for_torch/sparsity/`. No existing file is touched.
+All changes are additive: 22 new files, confined entirely to
+`quark/contrib/attention_sparsity/` and `examples/contrib/attention_sparsity/`.
+No existing file is touched.
 
 What each file does:
 
@@ -66,16 +116,19 @@ What each file does:
 - `methods/flash_skip_softmax.py`: reference, measurement-only skip-softmax
   computation.
 - `calibration/calibrator.py`: threshold/sparsity curve fitting.
-- `calibration/context.py`: `F.softmax` hook that feeds the calibrator
-  during a real forward pass.
+- `calibration/context.py`: per-attention-module `F.softmax` hook that feeds
+  the calibrator during a real forward pass.
+- `examples/contrib/attention_sparsity/calibrate_model.py`: runnable
+  argparse driver (answers the "no examples driver yet" item from the
+  previous round, see Section 6).
 
-Size: about **830 lines of implementation**, about **840 lines of tests**
-(56 tests) -- roughly one line of test per line of code.
+Size: about **1000 lines of implementation**, about **1150 lines of tests**
+(70 tests), roughly one line of test per line of code.
 
 Calibrated real models (Qwen3-8B, Llama-3.1-8B-Instruct) against real RULER
 prompts, round-tripped the checkpoint export/reload, and cross-checked the
-calibrated fit against the real production kernel. All 56 tests pass; actual
-test execution time is about **5 seconds** (most of a standalone run's wall
+calibrated fit against the real production kernel. All 70 tests pass; actual
+test execution time is about **2 minutes** (most of a standalone run's wall
 time is one-time Python/torch/transformers import overhead paid once per
 pytest process, not specific to this addition), negligible next to existing
 test directories of similar or larger size.
@@ -95,7 +148,9 @@ test directories of similar or larger size.
           "decode": {"a": "...", "b": "..."}
         },
         "target_sparsity": {"prefill": 0.5, "decode": 0.0},
-        "ignore": ["model.layers.0.self_attn"]
+        "ignore": ["model.layers.0.self_attn"],
+        "block_size": 64,
+        "query_block_size": 128
       }
     },
     "producer": {"name": "quark", "version": "0.x"}
@@ -111,29 +166,34 @@ attention-score distribution, not of which accelerator executes it. A
 checkpoint calibrated by this tooling
 should in principle be readable by NVIDIA-compatible tooling and vice versa.
 
-## 5. Open for discussion
+New since the previous round: `block_size`/`query_block_size` record the
+key-block and query-tile size the calibration assumed (analogous to a real
+kernel's `BLOCK_N`/`BLOCK_M`), so a consumer can confirm its own kernel's
+tiling still matches before reusing these coefficients: a mismatch here
+invalidates the fit regardless of how good `r_squared` looked at calibration
+time.
 
-- Does the package placement and layout above match how Quark would want a
-  new optimization technique organized, or is there an existing convention we
-  should follow more closely?
-- Right now, `export.py` writes and reads the checkpoint config on its own,
-  separate from `BaseExporter`/`SafetensorsExporter` (the existing
-  quantization export path). We think that is fine, since no weight tensors
-  are touched here, only a `config.json` metadata key. Does that match how
-  you would want it done, or should it hook into the existing exporter
-  framework some other way?
+## 5. Resolved from the previous round
+
+- **Placement**: resolved by moving to `quark/contrib/attention_sparsity/`
+  (Section 2); see "Changes since review" above.
+- **Export placement**: `export.py` still writes/reads the checkpoint config
+  on its own, separate from `BaseExporter`/`SafetensorsExporter`, since no
+  weight tensors are touched here, only a `config.json` metadata key. We
+  added a test proving this composes cleanly with the existing quantization
+  export path (no key collision between `sparse_attention_config` and
+  `quantization_config` on the same `model.config`) as evidence for keeping
+  it this way rather than folding it into `quark/torch/export/`. Let us know
+  if you'd still rather see it integrated differently.
 
 ## 6. Explicitly out of scope here
 
 - **Serving-side consumption** (reading `sparse_attention_config` back out at
   inference time): handled separately as part of integrating BLASST into
   ATOM.
-- **A built-in RULER/dataset loader**: the `README.md` will include an
-  example of using the RULER benchmark as calibration input.
-- **An `examples/` driver script**: quantization and pruning each have a
-  runnable argparse-based driver under `examples/torch/language_modeling/...`.
-  This package only has the package itself under
-  `quark/torch/sparsity/attention_sparsity/`, with usage documented in its
-  own package README; no `examples/attention_sparsity/` driver script yet
-  (mirroring NVIDIA's own `hf_sa.py` driver, if added). Can be added later to
-  match convention if useful.
+- **A built-in RULER/dataset loader**: the package README documents using the
+  RULER benchmark as calibration input; no built-in loader is shipped.
+
+(The `examples/` driver script originally listed here as future work now
+exists: `examples/contrib/attention_sparsity/calibrate_model.py`, see
+Section 3.)
