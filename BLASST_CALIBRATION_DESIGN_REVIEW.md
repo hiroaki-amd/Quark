@@ -1,6 +1,31 @@
 # BLASST attention-sparsity calibration in Quark: design for review
 
-## Changes since review
+## Changes since round 2 feedback
+
+The reviewer came back with two remaining small points plus a separate process question.
+Both technical points are implemented and validated:
+
+1. **Schema extensibility.** The underlying ask was that the schema be able to capture
+   any kernel-specific skip-granularity parameter, not just a 2D tile shape, without a
+   breaking schema change later (the GQA-head-packing mention was one illustrative
+   example, not the literal requirement). Added a free-form `kernel_metadata: dict`
+   field to both `CalibrationConfig` and the exported group
+   (`SparseAttentionAttributeConfig`): any kernel-specific parameter can be set there and
+   is copied verbatim into the exported `sparse_attention_config`, with no schema version
+   bump needed for a new key. Round-tripped through the real `calibrate` ->
+   `export_sparse_attention_config` -> `save_pretrained` -> reload path in a test.
+2. **`query_block_size` default mismatch.** `block_size`/`query_block_size` on
+   `CalibrationConfig` are now required (keyword-only, no default) instead of silently
+   defaulting to `64`/`1`: a caller who forgot to set one got a fit that still looked
+   fine (a good `r_squared`) but didn't match any real tiled kernel. Forcing an explicit
+   choice removes that silent-wrong-default risk entirely, rather than just picking one
+   default over the other.
+
+The process question (opening the PR against `AMD-NeuralOpt/Quark` directly rather than
+the public fork) is still open on our side: we don't yet have push access to that repo
+and are following up separately.
+
+## Changes since round 1 feedback
 
 An earlier version of this doc was reviewed by the Quark team, who sent four points of feedback.
 All four were implemented and validated (not just discussed) before this
@@ -123,12 +148,12 @@ What each file does:
   argparse driver (answers the "no examples driver yet" item from the
   previous round, see Section 6).
 
-Size: about **1000 lines of implementation**, about **1150 lines of tests**
-(70 tests), roughly one line of test per line of code.
+Size: about **1050 lines of implementation**, about **1200 lines of tests**
+(73 tests), roughly one line of test per line of code.
 
 Calibrated real models (Qwen3-8B, Llama-3.1-8B-Instruct) against real RULER
 prompts, round-tripped the checkpoint export/reload, and cross-checked the
-calibrated fit against the real production kernel. All 70 tests pass; actual
+calibrated fit against the real production kernel. All 73 tests pass; actual
 test execution time is about **2 minutes** (most of a standalone run's wall
 time is one-time Python/torch/transformers import overhead paid once per
 pytest process, not specific to this addition), negligible next to existing
@@ -151,7 +176,8 @@ test directories of similar or larger size.
         "target_sparsity": {"prefill": 0.5, "decode": 0.0},
         "ignore": ["model.layers.0.self_attn"],
         "block_size": 64,
-        "query_block_size": 128
+        "query_block_size": 128,
+        "kernel_metadata": {}
       }
     },
     "producer": {"name": "quark", "version": "0.x"}
@@ -167,12 +193,15 @@ attention-score distribution, not of which accelerator executes it. A
 checkpoint calibrated by this tooling
 should in principle be readable by NVIDIA-compatible tooling and vice versa.
 
-New since the previous round: `block_size`/`query_block_size` record the
-key-block and query-tile size the calibration assumed (analogous to a real
-kernel's `BLOCK_N`/`BLOCK_M`), so a consumer can confirm its own kernel's
-tiling still matches before reusing these coefficients: a mismatch here
-invalidates the fit regardless of how good `r_squared` looked at calibration
-time.
+`block_size`/`query_block_size` record the key-block and query-tile size the
+calibration assumed (analogous to a real kernel's `BLOCK_N`/`BLOCK_M`), so a
+consumer can confirm its own kernel's tiling still matches before reusing these
+coefficients: a mismatch here invalidates the fit regardless of how good
+`r_squared` looked at calibration time. New since round 2 feedback:
+`kernel_metadata` is a free-form dict for any kernel-specific skip-granularity
+parameter beyond a simple 2D tile (e.g. `{"gqa_group_size": 8}` for a kernel
+that packs a GQA group's query heads into one physical tile): a new key here
+never requires a schema version bump.
 
 ## 5. Resolved from the previous round
 
